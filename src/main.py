@@ -4,10 +4,10 @@
 import os
 
 # load pLM from hugging face model cache
-path = os.environ['HOME']
-os.environ['HF_HOME']=f"{path}/.cache/huggingface"
-os.environ['TRANSFORMERS_CACHE']=f"{path}/.cache/huggingface/models"
-os.environ['TRANSFORMERS_OFFLINE']= '1'
+#path = os.environ['HOME']
+#os.environ['HF_HOME']=f"{path}/.cache/huggingface"
+#os.environ['TRANSFORMERS_CACHE']=f"{path}/.cache/huggingface/models"
+#os.environ['TRANSFORMERS_OFFLINE']= '1'
 
 from config_args import get_args
 from utils import batch_datasets, initialize_logger, initialize_best_metrics_dict

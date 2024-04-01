@@ -3,7 +3,7 @@
 
 # Synthetic coevolution reveals adaptive mutational trajectories of neutralizing antibodies and SARS-CoV-2
 
-Implementation of the paper [[Synthetic coevolution reveals adaptive mutational trajectories of neutralizing antibodies and SARS-CoV-2]()], by
+Implementation of the paper [[Synthetic coevolution reveals adaptive mutational trajectories of neutralizing antibodies and SARS-CoV-2]()], by Roy Ehling, Mason Minot, Max Overath, Daniel Sheward, Jiami Han, Beichen Gao, Joseph Taft, Margarita Pertseva, Cedric Weber, Lester Frei, Thomas Bikias, Ben Murrell, and Sai Reddy.
 
 ## Table of contents
 1. [Environment](#environment)
