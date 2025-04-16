@@ -37,17 +37,17 @@ conda activate syn_coev
 
 ### Step 1 - Preprocessing
 Note: Data will be made available following publication.
-In `scripts/` run `preprocessing.sh`.
+In `src/scripts/` run `preprocessing.sh`.
 
 ### Step 2 - Model Training and Evaluation
 
-In `scripts/` run `train.sh`.
+In `src/scripts/` run `train.sh`.
 This will populate the folder `results/` with .csv files in the appropriate format for plotting in Step 3.
 
-Note: to execute DDP training runs via slurm, an example is provided in `example_slurm_submission.slurm`.
+Note: to execute DDP training runs via slurm, an example is provided in `src/example_slurm_submission.slurm`.
 
 ### Setp 3 - Plot Results
-In `scripts/` run `plot.sh`.
+In `src/scripts/` run `plot.sh`.
 
 ## Citation
 
