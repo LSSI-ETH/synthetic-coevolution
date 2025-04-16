@@ -4,6 +4,8 @@
 import torch
 import torch.nn as nn
 from transformers import EsmModel
+from models.attn_modules import get_esm_model_str
+import os
 
 #----
 # ESM-2 Backbone
@@ -13,8 +15,11 @@ class Backbone_ESM(nn.Module):
     def __init__(self, args):
         super().__init__()
         
-        #model_str, self.esm_emb_dim = get_esm_model_str(args)
-        model_str, self.esm_emb_dim = 'facebook/esm2_t6_8M_UR50D', 320
+        model_str, self.esm_emb_dim = get_esm_model_str(args)
+
+        if os.environ['TRANSFORMERS_OFFLINE']== '1':
+            path = os.environ['HOME']
+            model_str = f"{path}/.cache/huggingface/models/{model_str}"
         
         self.base_network = EsmModel.from_pretrained(model_str,
                                                      output_attentions = args.return_esm_attns,
@@ -37,7 +42,7 @@ class Backbone_ESM(nn.Module):
 class PlmOnly(nn.Module):
     def __init__(self, 
                  input_size = 201,
-                 input_emb_dim = 320, 
+                 input_emb_dim = 480, 
                  n_classes = 39, 
                  args = None,
                  device = None):
@@ -48,7 +53,6 @@ class PlmOnly(nn.Module):
 
         input_dim = int( input_size * self.backbone.esm_emb_dim)
         
-        #input_dim = 320
         self.linear = nn.Linear(input_dim, n_classes)
         self.flatten = nn.Flatten()
 

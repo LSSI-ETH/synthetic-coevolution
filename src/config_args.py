@@ -45,13 +45,10 @@ def get_args():
     # masked label modeling
     parser.add_argument('--lmt_mask_fraction', default = 0.85, type = float,
                         help='fraction of labels to mask for rbd_plm')
-    parser.add_argument('--lmt_threshold', default = 3, type = int,
-                        help='minimum number of labels per seq required masked lable training')
     parser.add_argument('--initiate_lmt_threshold', default = 0.75, type = float,
                     help='threshold to activate lmt')    
     parser.add_argument('--use_lmt', action='store_false',
                         help='use lmt for rbd_plm')
-
     # esm params
     parser.add_argument('--return_esm_attns', action='store_true',
                         help='return esm attention tensors during fwd pass')
@@ -60,12 +57,14 @@ def get_args():
     parser.add_argument('--opt_id', default='adam', type=str,
                         help='optimizer type',
                         choices = ['sgd', 'adam'])
-    parser.add_argument('--learn_rate', default=3e-5, type=float,
+    parser.add_argument('--learn_rate', default=1e-4, type=float,
                     help='initial optimizer learning rate')
     parser.add_argument('--weight_decay', default=1e-1, type=float,
                 help='initial optimizer learning rate')
-    parser.add_argument('--lr_scheduler', default=None, type=bool,
+    parser.add_argument('--lr_scheduler', default='cosine_restart_warmup', type=str,
                     help='include learn rate scheduler')
+    parser.add_argument('--warmup_epochs', default=20, type=int,
+                    help='warmup for use with lr scheduler')
     parser.add_argument('--bert_adam',  default = True, type=bool,
                     help='whether or not to use BertAdam. if True,'\
                         ' omit bias correction per'\
@@ -90,7 +89,8 @@ def get_args():
                         help='BCEWithLogitLoss reduction, options none, mean, sum')    
     # data
     parser.add_argument('--dataset', default='ed_3', type=str,
-                        choices=['ed_3','ed_10','main'])
+                        choices = ['ed_3','ed_10','main','holdout']
+                        )
     # gpu
     parser.add_argument('--distributed', default = False, type=bool,
                     help='use DistributedDataParallel')
@@ -109,6 +109,10 @@ def get_args():
                     help='gradient accumulation steps')
     parser.add_argument('--wandb_logging',action='store_false',
                         help='enable logging via wandb')
+    
+    # misc
+    parser.add_argument('--run_lcoation', type=str, default='local',
+                        help='slurm, local')
     
     parser.set_defaults()
     args = parser.parse_args()

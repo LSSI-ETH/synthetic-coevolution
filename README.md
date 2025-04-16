@@ -1,9 +1,9 @@
-![Python Version: 3.8.5](https://img.shields.io/badge/Python%20Version-3.8.5-blue)
+![Python Version: 3.10.11](https://img.shields.io/badge/Python-3.10.11-blue)(https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-brightgreen)](https://opensource.org/licenses/MIT)
 
 # Synthetic coevolution reveals adaptive mutational trajectories of neutralizing antibodies and SARS-CoV-2
 
-Implementation of the paper [[Synthetic coevolution reveals adaptive mutational trajectories of neutralizing antibodies and SARS-CoV-2](https://doi.org/10.1101/2024.03.28.587189)], by Roy Ehling, Mason Minot, Max Overath, Daniel Sheward, Jiami Han, Beichen Gao, Joseph Taft, Margarita Pertseva, Cedric Weber, Lester Frei, Thomas Bikias, Ben Murrell, and Sai Reddy.
+Implementation of the paper [[Synthetic coevolution reveals adaptive mutational trajectories of neutralizing antibodies and SARS-CoV-2](https://doi.org/10.1101/2024.03.28.587189)], by Roy Ehling<sup>* </sup>, Mason Minot<sup>*</sup>, Max Overath, Daniel Sheward, Jiami Han, Beichen Gao, Joseph Taft, Margarita Pertseva, Cedric Weber, Lester Frei, Thomas Bikias, Ben Murrell, and Sai Reddy.
 
 ## Table of contents
 1. [Environment](#environment)
@@ -11,6 +11,10 @@ Implementation of the paper [[Synthetic coevolution reveals adaptive mutational 
 3. [Citation](#citation)
 
 ## Environment 
+
+Note: analysis run with torch 2.1.2+cu121, but environment contains torch 2.1.2. 
+Find the correct torch 2.1.2 for your OS/torch/cuda combination here
+https://pytorch.org/get-started/previous-versions/#v212
 
 #### Conda
 
@@ -36,10 +40,11 @@ Note: Data will be made available following publication.
 In `scripts/` run `preprocessing.sh`.
 
 ### Step 2 - Model Training and Evaluation
-Note: analysis run with torch 2.1.2+cu121, but environment contains torch 2.1.2
 
 In `scripts/` run `train.sh`.
 This will populate the folder `results/` with .csv files in the appropriate format for plotting in Step 3.
+
+Note: to execute DDP training runs via slurm, an example is provided in `example_slurm_submission.slurm`.
 
 ### Setp 3 - Plot Results
 In `scripts/` run `plot.sh`.

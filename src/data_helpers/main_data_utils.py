@@ -52,11 +52,7 @@ def get_xs_and_ys_main_data(args):
     
     logging.info(f'Train, Val, Test: {len(train)}, {len(val)}, {len(test)}')
 
-    if 'esm' not in args.dataset:
-        feature_col = 'aa_seq'
-        
-    elif 'esm' in args.dataset:
-        feature_col = 'embedding'
+    feature_col = 'aa_seq'
         
     x_train = train[feature_col]
     x_val = val[feature_col]
@@ -89,25 +85,21 @@ def batch_datasets_main(args):
     
     x_train, x_val, x_test, y_train, y_val, y_test, class_freq = get_xs_and_ys_main_data(args)
     
-    if 'esm' not in args.dataset and 'esm' not in args.rbd_plm_backbone:
+    if 'esm' not in args.rbd_plm_backbone:
         
         x_train = encode_ngrams(x_train, args)
         x_val = encode_ngrams(x_val, args)
         x_test = encode_ngrams(x_test, args)
         
-    elif 'esm' in args.dataset or 'esm' in args.rbd_plm_backbone:
+    elif 'esm' in args.rbd_plm_backbone:
         
         x_train = x_train.to_list()
         x_val = x_val.to_list()
         x_test = x_test.to_list()
+
+    train_dataset = x_y_to_dataset(x_train, y_train, is_test = False, args = args)
+    val_dataset = x_y_to_dataset(x_val, y_val, is_test = False, args = args)
+    test_dataset = x_y_to_dataset(x_test, y_test, is_test = True, args = args)
+
+    return train_dataset, val_dataset, test_dataset, class_freq
     
-    train_loader, train_sampler = data_to_loader(x = x_train, y=y_train, 
-                                  is_test = False, args = args)
-    
-    val_loader, _ = data_to_loader(x = x_val, y=y_val, 
-                                is_test = False, args = args)
-    
-    test_loader, _ = data_to_loader(x = x_test, y=y_test, 
-                                 is_test = True, args = args)
-    
-    return train_loader, val_loader, test_loader, class_freq, train_sampler 

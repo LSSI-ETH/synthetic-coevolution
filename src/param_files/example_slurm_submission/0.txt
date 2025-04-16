@@ -1,0 +1,6 @@
+--rbd_plm_backbone=esm_35m
+--dataset=ed_3
+--basemodel=rbd_plm
+--seed=1
+--combined_attn_layers=1
+--inter_attn_layers=2

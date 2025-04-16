@@ -11,91 +11,85 @@ import os
 
 from config_args import get_args
 from utils import batch_datasets, initialize_logger, initialize_best_metrics_dict
-from utils import bin_labels_by_frequency, find_free_port, save_checkpoint 
-from utils import load_checkpoint, EarlyStopper
-from data_helpers.general_data_utils import get_voc_data_loader, voc_metrics
+from utils import bin_labels_by_frequency, find_free_port
+from utils import check_for_and_load_checkpoints_and_early_stopper
+from utils import load_best_chkpt_save_as_final_model
+from data_helpers.general_data_utils import get_voc_data_loader, voc_metrics, dataset_to_dataloader
 from train import Trainer
 
 import re
 import time
 import torch
 import torch.multiprocessing as mp
-import torch.utils.data.distributed
 import torch.distributed as dist
 import numpy as np
 import datetime
-import logging
 from socket import gethostname #slurm
 import wandb
 import pandas as pd
 
-# https://github.com/pytorch/pytorch/issues/1355
-torch.set_num_threads(5)   
     
-def main(gpu, args):
+def main(gpu, args, train_dataset, val_dataset, test_dataset, class_freq, world_size = None, master_port = None):
     
     # set seeds
     seed_entry = args.seed
     torch.manual_seed(seed_entry)
     torch.cuda.manual_seed(seed_entry)
     np.random.seed(seed_entry)
+    if args.distributed:
+        torch.cuda.manual_seed_all(args.seed)
     
     if torch.cuda.is_available():
         torch.backends.cudnn.deterministic = True
     
-    if args.basemodel == 'rbd_plm_lr':
-        assert args.rbd_plm_backbone == 'esm_8m'
+    if 'rbd_plm' not in args.basemodel:
+        args.rbd_plm_backbone = 'emb'
     
+    #==========================================================================
+    # Distributed Training & GPU Setup
     if torch.cuda.is_available():
-            use_cuda = True
-            args.non_block = True
-            args.use_amp = True
+        torch.backends.cudnn.deterministic = True
     else:
-        use_cuda = False
-        args.non_block = False
-        args.use_amp = False
-    
+        rank = 0
+        
     if torch.cuda.device_count() > 1:
+        print('Entered DDP Logic in Main Loop', flush = True)
         args.distributed = True
-        args.data_parallel = True
         args.backend = 'nccl'
         
-        # ddp slurm
-        # https://github.com/PrincetonUniversity/multi_gpu_training/tree/main/02_pytorch_ddp
-        #rank          = int(os.environ["SLURM_PROCID"])
-        #world_size    = int(os.environ["SLURM_NPROCS"])
-        #gpus_per_node = int(os.environ["SLURM_GPUS_ON_NODE"])
-        #args.num_gpus = gpus_per_node
+        #Torch DDP slurm initialization
+        #https://github.com/PrincetonUniversity/multi_gpu_training/tree/main/02_pytorch_ddp
+        os.environ['MASTER_PORT'] = master_port
+        gpus_per_node = int(os.environ["SLURM_GPUS_ON_NODE"])
+        args.num_gpus = gpus_per_node
+        assert gpus_per_node == torch.cuda.device_count()
 
-        # ddp no slurm
-        rank = gpu
-        world_size = args.num_gpus
-        assert world_size == torch.cuda.device_count()
+        dist.init_process_group(backend=args.backend,rank=gpu, world_size=args.num_gpus,)#slurm
+        #https://github.com/ShigekiKarita/pytorch-distributed-slurm-example/blob/master/main_distributed.py
+        
+        args.batch_size = args.batch_size * args.num_gpus
+        args.learn_rate = args.learn_rate * args.num_gpus
 
-        if rank == 0 :
-            import socket
-            ip = socket.gethostbyname(socket.gethostname())
-            port = find_free_port()
-            init_url = "tcp://{}:{}".format(ip, port)
+        rank = dist.get_rank()
 
-        dist.init_process_group(backend=args.backend,rank=rank, world_size=world_size, init_method=init_url, ) #slurm
-        # https://github.com/ShigekiKarita/pytorch-distributed-slurm-example/blob/master/main_distributed.py
-    
-        args.batch_size = args.num_gpus * args.batch_size
-        args.learn_rate = args.num_gpus * args.learn_rate 
-
-        logging.info('Initialized the distributed environment: \'{}\' backend on {} nodes. '.format(
+        print('Initialized the distributed environment: \'{}\' backend on {} nodes. '.format(
             args.backend, dist.get_world_size()) + 'Current host rank is {}. Number of gpus: {}'.format(
             dist.get_rank(), args.num_gpus))   
+    #==========================================================================
         
-        torch.cuda.set_device(gpu)
-
-    device = torch.device(gpu if use_cuda else "cpu")
+    device = torch.device(gpu if torch.cuda.is_available() else "cpu")
     
+    # initialize data loaders if not already initialized
+    if 'rbd_plm' not in args.basemodel:
+        print('Now setting up dataset inside mp.spawn', flush = True)
+        train_dataset, val_dataset, test_dataset, class_freq = batch_datasets(args)
 
-    # initialize data loaders
-    # extra loader contains either highly labeled or class 3 sequences
-    train_loader, val_loader, test_loader, args.class_freq, train_sampler = batch_datasets(args = args)
+    args.class_freq = class_freq
+
+    train_loader, train_sampler = dataset_to_dataloader(train_dataset, is_test = False, args = args)
+    val_loader, val_sampler = dataset_to_dataloader(val_dataset, is_test = False, args = args)
+    test_loader, _ = dataset_to_dataloader(test_dataset, is_test = True, args = args)
+
     he_voc_data_loader = get_voc_data_loader(voc_str = 'he', args = args)
     taft_voc_data_loader = get_voc_data_loader(voc_str = 'taft', args = args)
     
@@ -107,20 +101,23 @@ def main(gpu, args):
     args.label_idx_high, args.label_idx_mid, args.label_idx_tail = bin_labels_by_frequency(args)
     
     hparams = vars(args)
-    logging.info(args)
+    print(args, flush = True)
     
     current_date = str(datetime.datetime.now().strftime("%d-%m-%Y"))
     
     # wandb logging initialization
     is_rank0_wandb_logging = False
     if args.wandb_logging:
+        print(f'Wandb Logging Enabled: {args.wandb_logging}', flush = True)
+        print(f'torch.cuda.device_count() > 1: {torch.cuda.device_count() > 1}', flush = True)
         if torch.cuda.device_count() > 1:
+            print(f'rank: {rank}', flush = True)
             if rank == 0 :
+                print(f'rank: {rank} is logging', flush = True)
                 run = wandb.init(
                 # set the wandb project where this run will be logged
-                project=f'{args.wandb_project}_{args.dataset}_{args.basemodel}_{args.rbd_plm_backbone}_{current_date}',
+                project = f'{args.wandb_project}_{args.dataset}_{current_date}',
                 settings=wandb.Settings(start_method="fork"),
-                # track hyperparameters and run metadata
                 config=args
                 )
             
@@ -130,9 +127,7 @@ def main(gpu, args):
             
         else:
             run = wandb.init(
-            # set the wandb project where this run will be logged
             project=f'{args.wandb_project}_{current_date}',
-            # track hyperparameters and run metadata
             config=args
             )
             is_rank0_wandb_logging = True
@@ -141,131 +136,108 @@ def main(gpu, args):
     #===================================== Initialize Model =======================================================
     model = Trainer(args,device)
     model.model = model.model.to(device)
-        
-    # Check if checkpoints exists
-    training_completed = False
     
-    # check if trained model is avilable
-    if os.path.isfile(args.checkpoint_path + f'best_validation_model_final_{args.param_file}.pth'):
-        model.model, model.optimizer, start_epoch, checkpoint_val_loss, patience_counter = load_checkpoint(model.model, 
-                                                                          model.optimizer,
-                                                                          gpu,
-                                                                          args,
-                                                                          val = False,
-                                                                          test = True)
-        epoch = args.epochs + 1
-        training_completed = True
+    print(f'model: {model.model}', flush = True)
 
-    #check if best validation checkpoint exists
-    elif os.path.isfile(args.checkpoint_path + f'checkpoint_best_validation_model_{args.param_file}.pth'):
-        model.model, model.optimizer, start_epoch, checkpoint_val_loss, patience_counter = load_checkpoint(model.model, 
-                                                                          model.optimizer,
-                                                                          gpu,
-                                                                          args,
-                                                                          val = True)
-        epoch = start_epoch
-        if patience_counter >= args.patience:
-            training_completed = True
-        
-    else:
-        start_epoch, epoch, checkpoint_val_loss, patience_counter = 0,0, float('inf'), 0
+    print(f'number params: {sum(p.numel() for p in model.model.parameters() if p.requires_grad)}', flush = True)
+    
+    model.model, model.optimizer, epoch, start_epoch, early_stopper = check_for_and_load_checkpoints_and_early_stopper(model.model, model.optimizer, gpu, args)
     
     if torch.cuda.device_count() > 1:
-        logging.info("Using", torch.cuda.device_count(), "GPUs!")
+        print("Using", torch.cuda.device_count(), "GPUs!", flush = True)
         model.model = torch.nn.parallel.DistributedDataParallel(model.model, device_ids=[gpu], output_device=gpu)
     
-    model.model = torch.compile(model.model)
+    # torch 2.1.2 cuda 12.1.1 issue 
+    # https://discuss.pytorch.org/t/runtime-error-when-running-inference-on-a-compiled-nn-transformerencoder/198010
+    if args.basemodel != 'transformer':
+        model.model = torch.compile(model.model)
         
-    logging.info(f'\nNow Training with model {args.basemodel}')
-    logging.info(f'learn rate, scheduler, optimizer:  {args.learn_rate}, {args.lr_scheduler}, {args.opt_id}')
-    logging.info(f'loss function: {args.loss_fn}')
+        
+    print(f'\nNow Training with model {args.basemodel}', flush = True)
+    print(f'dataset: {args.dataset}', flush = True)
+    print(f'learn rate, scheduler, optimizer:  {args.learn_rate}, {args.lr_scheduler}, {args.opt_id}', flush = True)
+    print(f'loss function: {args.loss_fn}', flush = True)
+    
 
     #======================     Train & Eval Cycle          ===================================
     metrics_dict = initialize_best_metrics_dict()
 
-    if training_completed: 
+    if early_stopper.early_stop_executed: 
         total_training_time = 0.
         
-    elif not training_completed:
-        # account for async cuda operations if using gpu
+    elif not early_stopper.early_stop_executed:
+        #account for async cuda operations if using gpu
         if torch.cuda.device_count() > 0:
-            start_time = torch.cuda.Event(enable_timing=True)
-            end_time = torch.cuda.Event(enable_timing=True)
-            start_time.record()
+            if rank == 0 :
+                start_time = torch.cuda.Event(enable_timing=True)
+                end_time = torch.cuda.Event(enable_timing=True)
+                start_time.record()
         else:
             training_start_time = time.time()    
            
         #Train / Eval
-        logging.info(f'Normal training now starting at start ep: {start_epoch}')
-        
-        early_stopper = EarlyStopper(patience=args.patience)
-        early_stopper.min_validation_loss = checkpoint_val_loss
-        early_stopper.counter = patience_counter
+        print(f'Normal training now starting at start ep: {start_epoch}', flush = True)
        
         for epoch in range(start_epoch, args.epochs):
-            logging.info(f'EPOCH {epoch}')
+            print(f'EPOCH {epoch}')
             
-            model.train_step(train_loader,epoch,is_rank0_wandb_logging,args.batch_size, train_sampler)
+            if args.distributed:
+                with model.model.join():
+                    model.train_step(train_loader,epoch,is_rank0_wandb_logging,args.batch_size, train_sampler)
+                torch.cuda.synchronize(device=gpu)
+            else:
+                model.train_step(train_loader,epoch,is_rank0_wandb_logging,args.batch_size, train_sampler)
+            
             
             if args.evaluate_valset and epoch % args.evaluate_valset_interval == 0:
         
-                metrics_dict, attns = model.test_step(val_loader, epoch, is_rank0_wandb_logging)
+                metrics_dict, _ = model.test_step(val_loader, epoch, is_rank0_wandb_logging)
                 
-                #chkpt lowest val loss & eval early stopping
+                if args.distributed: torch.cuda.synchronize(device=gpu)
+                
+                if epoch > args.warmup_epochs:
+                    _ = early_stopper.early_stop(validation_loss = metrics_dict['loss'],
+                                                        model = model.model,
+                                                        optimizer = model.optimizer,
+                                                        epoch = epoch,
+                                                        gpu = gpu,
+                                                        args = args)        
+                    if args.distributed:
+                        dist.broadcast(early_stopper.early_stop_flag_tensor, src=0)
+
+                    if early_stopper.early_stop_flag_tensor >= 1:
+                        print(f'Training early stopped on gpu {gpu}', flush = True)
+                        
+                        if args.distributed:
+                            dist.barrier()
+                        break
+
+        if args.distributed:
+            dist.barrier()
     
-                #if epoch > 10 and early_stopper.early_stop(validation_loss = metrics_dict['loss'],
-                if epoch > 10 and early_stopper.early_stop(validation_loss = metrics_dict['loss'],
-                                                          model = model.model,
-                                                          optimizer = model.optimizer,
-                                                          epoch = epoch,
-                                                          gpu = gpu,
-                                                          args = args):                
-                    break
-    
-        # account for async cuda operations if using gpu
+        
         if torch.cuda.device_count() > 0:
-            end_time.record()
-            torch.cuda.synchronize()
-            total_training_time = start_time.elapsed_time(end_time)/10**3
+            if rank == 0 :
+                end_time.record()
+                torch.cuda.synchronize()
+                total_training_time = start_time.elapsed_time(end_time)/10**3
         else:                
             training_end_time = time.time()
             total_training_time = training_end_time - training_start_time
-
-        if not training_completed:            
+        
+    # attempt to load compiled model
+    print('Attempting to load best model from training run', flush = True)
+    model_final = Trainer(args,gpu)
+    model_final.model = model_final.model.to(gpu)
+    model_final.model, model_final.optimizer = load_best_chkpt_save_as_final_model(model_final.model, model_final.optimizer,
+                                                                                    metrics_dict['loss'], epoch, gpu, 
+                                                                                    args, early_stopper)
+    
+    print(f'Final model loaded successfully to gpu: {gpu}', flush = True)
+    if args.basemodel != 'transformer':
+        model_final.model = torch.compile(model_final.model)
             
-            # attempt to load compiled model
-            try:
-                # load best model from early stopping checkpoint
-                model.model, model.optimizer, epoch, metrics_dict['loss'], _ = load_checkpoint(model.model, 
-                                                                        model.optimizer,
-                                                                        gpu,
-                                                                        args,
-                                                                        val = True,
-                                                                        test = False)
-            
-            # if unable to load torch.compiled model, reinitialize & recompile first
-            except:
-                model = Trainer(args,device)
-                model.model = model.model.to(device)
-                # load best model from early stopping checkpoint
-                model.model, model.optimizer, epoch, metrics_dict['loss'], _ = load_checkpoint(model.model, 
-                                                                        model.optimizer,
-                                                                        gpu,
-                                                                        args,
-                                                                        val = True,
-                                                                        test = False)
-                model.model = torch.compile(model.model)
-                
-
-            # save final model at end of training
-            if gpu == 0 or device.type == 'cpu':
-                save_checkpoint(model.model, model.optimizer, epoch, gpu, args, 
-                        metrics_dict['loss'],
-                        patience_counter = early_stopper.counter,
-                        val = False,
-                        test = True)
-
-    test_metrics_dict, _  = model.test_step(test_loader, epoch, is_rank0_wandb_logging, is_test = True)
+    test_metrics_dict, _  = model_final.test_step(test_loader, epoch, is_rank0_wandb_logging, is_test = True)
         
     test_metrics_dict = {f'{k}_test': v for k, v in test_metrics_dict.items()}.copy() #append '_test' to dictionary string names
 
@@ -277,7 +249,8 @@ def main(gpu, args):
                         voc_str = 'taft', is_test = True)
 
     del model
-    logging.info('Now Deleting Model & writing metrics')
+    del model_final
+    print('Now Deleting Model & writing metrics', flush = True)
     
     def clean_metric_output(metric_dict):
 
@@ -307,7 +280,10 @@ def main(gpu, args):
     output_dict = {**hparams, **metrics_dict, **test_metrics_dict, 
                **he_metrics_dict, **taft_metrics_dict}
     output_dict['time'] = output_time
-    output_dict['total_training_time'] = total_training_time
+    try:
+        output_dict['total_training_time'] = total_training_time
+    except:
+        output_dict['total_training_time'] = 'not available'
 
     output_path = args.output_data_dir
     filename = f'{output_path}/{args.dataset}_{args.basemodel}.csv'
@@ -327,35 +303,71 @@ if __name__ == '__main__':
     current_time = str(datetime.datetime.now().strftime("%d-%m-%Y"))
     args.param_file = f'{args.dataset}_{args.basemodel}_{args.rbd_plm_backbone}_{args.seed}_{current_time}'        
     args.wandb_project = args.param_file
-    initialize_logger(args)
-    os.environ["WANDB__SERVICE_WAIT"] = "300"
 
-    if torch.cuda.device_count() > 1:
-        
-        # slurm job setup
-        #param_folder = str(os.environ["PARAM_FOLDER"])
-        #param_file_queue = int(os.environ["PARAM_FILE_QUEUE"])
-        #slurm_arr_id = int(os.environ["SLURM_ARRAY_TASK_ID"])
-        #slurm_job_id = int(os.environ["SLURM_JOBID"])
-        #args.param_file = f'{param_folder}_{param_file_queue}h_{slurm_arr_id}'        
-        #args.wandb_project = f'{param_folder}_slurm_job_id'
-        #args.num_gpus = int(os.environ["SLURM_GPUS_ON_NODE"])
-        
-        args.num_gpus = torch.cuda.device_count()
-        mp.spawn(main, nprocs=args.num_gpus, args=(args,))
-    
+    if args.basemodel != 'transformer':
+        torch.set_float32_matmul_precision('high') # torch compile
+       
+    # initiate datasets on master rank or cpu if possible
+    # due to memory contraints, one-hot encoding datasets batched on all workers in mp.spawn
+    if 'rbd_plm' in args.basemodel:
+        train_dataset, val_dataset, test_dataset, class_freq = batch_datasets(args)
     else:
+        train_dataset, val_dataset, test_dataset, class_freq = None, None, None, None
+    
+    args.non_block = False
+    args.use_amp = False
+    args.fused = False
+    args.foreach = True
 
-        # slurm job setup 
-        #param_folder = str(os.environ["PARAM_FOLDER"])
-        #param_file_queue = int(os.environ["PARAM_FILE_QUEUE"])
-        #slurm_arr_id = int(os.environ["SLURM_ARRAY_TASK_ID"])
-        #slurm_job_id = int(os.environ["SLURM_JOBID"])
-        #args.param_file = f'{param_folder}_{param_file_queue}h_{slurm_arr_id}'        
-        #args.wandb_project = f'{param_folder}_slurm_job_id'
+    if torch.cuda.device_count() > 0:
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = True
+        args.non_block = True
+        args.use_amp = True
+        args.fused = True
+        args.foreach = False
+        
+        if torch.cuda.device_count() > 1:
+            args.distributed = True
+            args.backend = 'nccl'
+        
+        # slurm & ddp launch        
+        if args.run_location == 'slurm':
+            param_folder = str(os.environ["PARAM_FOLDER"])
+            slurm_arr_id = int(os.environ["SLURM_ARRAY_TASK_ID"])
+            slurm_job_id = int(os.environ["SLURM_JOBID"])
+            args.param_file = f'{param_folder}_{slurm_arr_id}'        
+            args.num_gpus = int(os.environ["SLURM_GPUS_ON_NODE"])
+        else:
+            current_date = str(datetime.datetime.now().strftime("%d-%m-%Y"))
+            param_folder = f'{args.dataset}_{args.model}_{current_date}'
+            slurm_arr_id = ''
+            slurm_job_id = 0
+            args.num_gpus = torch.cuda.device_count()
+            args.param_file = f'{param_folder}'
+
+        os.environ["WANDB__SERVICE_WAIT"] = "300"
+        initialize_logger(args)
+
+        args.wandb_project = f'{param_folder}'
+        
+        # uncomment for ddp debug
+        #os.environ["TORCH_CPP_LOG_LEVEL"] = "INFO"
+        #os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
+        
+        world_size = int(
+            os.environ.get('WORLD_SIZE', os.environ.get('SLURM_NTASKS')))
+
+        master_port = find_free_port()
+        print('Found Master Port. Now Spawning processes', flush = True)
+        mp.spawn(main, nprocs=args.num_gpus, args=(args, train_dataset, val_dataset, test_dataset, class_freq, world_size, master_port))
+
+    else:
+        initialize_logger(args)
+        os.environ["WANDB__SERVICE_WAIT"] = "300"
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        main(device, args)
+        main(device, args, train_dataset, val_dataset, test_dataset, class_freq)
     
     if args.wandb_logging:
         wandb.finish()

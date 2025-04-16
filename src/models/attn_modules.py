@@ -72,10 +72,12 @@ class self_attn_block(nn.Module):
         if not self.return_attns:
             x2 = self.self_attn(norm1_x, norm1_x, norm1_x, need_weights = False,
                                 attn_mask = attn_mask)[0]
+                                #key_padding_mask = attn_mask)[0]
             attn = None
         else:
             x2, attn = self.self_attn(norm1_x, norm1_x, norm1_x, need_weights = True,
                                 attn_mask = attn_mask)
+                                #key_padding_mask = attn_mask)
         x2 = self.dropout(x2)
         x = x + x2
         x = self.MLP_Res_Block(x)
@@ -202,6 +204,9 @@ class inter_attn_layer(nn.Module):
         Sf = self.S_cross_attn(Sf, Lf, attn_mask = cross_attn_label_mask)
 
         return Lf, Sf
+
+
+
 
 #============== ESM Backbone Model Configuration ===============
 def get_esm_model_str(args):

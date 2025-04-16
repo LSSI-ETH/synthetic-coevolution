@@ -132,12 +132,12 @@ dmypy.json
 .zip
 *.tsv
 .tsv
-*.csv
-.csv
+#*.csv
+#.csv
 *.ipynb
 .ipynb
-*.gz
-.gz
+#*.gz
+#.gz
 .fasta
 *.fasta
 .pt

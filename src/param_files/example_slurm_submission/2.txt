@@ -1,0 +1,6 @@
+--rbd_plm_backbone=emb
+--dataset=ed_3
+--basemodel=cnn
+--seed=1
+--combined_attn_layers=1
+--inter_attn_layers=2

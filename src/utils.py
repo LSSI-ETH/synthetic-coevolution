@@ -7,9 +7,11 @@ import torch.distributed as dist
 
 from data_helpers.edit_distance_data_utils import batch_datasets_edit_distance
 from data_helpers.main_data_utils import batch_datasets_main
+from data_helpers.holdout_positions_data_utils import batch_datasets_holdout_positions
 
 import logging
 import datetime
+import os
 
 #=================================================
 def initialize_best_metrics_dict():
@@ -55,6 +57,8 @@ def initialize_best_metrics_dict():
 def batch_datasets(args):    
     if 'ed' in args.dataset:
             batch_datasets = batch_datasets_edit_distance
+    elif 'holdout' in args.dataset:
+        batch_datasets = batch_datasets_holdout_positions
     else:
         batch_datasets = batch_datasets_main
     return batch_datasets(args)
@@ -96,16 +100,18 @@ def initialize_logger(args):
         logging.info('\n----------------\n')
 
 # slurm distributed training
-# https://github.com/ShigekiKarita/pytorch-distributed-slurm-example/blob/master/main_distributed.py
 def find_free_port():
+    """ https://stackoverflow.com/questions/1365265/on-localhost-how-do-i-pick-a-free-port-number """
     import socket
-    s = socket.socket()
-    s.bind(('', 0))            # Bind to a free port provided by the host.
-    return s.getsockname()[1]  # Return the port number assigned.
+    from contextlib import closing
 
+    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
+        s.bind(('', 0))
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        return str(s.getsockname()[1])
 
-def save_checkpoint(model, optimizer, epoch, gpu, args, loss = None, 
-                    patience_counter = 0, val = False, test = False):
+def save_checkpoint(model, optimizer, epoch, gpu, args, early_stopper,
+                    loss = None, val = False, test = False):
     
     '''
     # save model checkpoint based on training, validation metrics, and testing status
@@ -115,49 +121,88 @@ def save_checkpoint(model, optimizer, epoch, gpu, args, loss = None,
     elif not val and test:
         chkpt_str = f'best_validation_model_final_{args.param_file}.pth'
     else:
-        chkpt_str = f'checkpoint_{args.param_file}.pth'
+        chkpt_str = f'checkpoint_best_validation_model_{args.param_file}.pth'
         
+    patience_counter = early_stopper.counter
+    early_stop_executed = early_stopper.early_stop_executed
+    early_stop_flag_tensor = early_stopper.early_stop_flag_tensor
+
     if gpu == 0:
-        logging.info("epoch: {} ".format(epoch+1))
+        print("epoch: {} ".format(epoch+1), flush = True)
         checkpointing_path = args.checkpoint_path + chkpt_str
-        logging.info("Saving the Checkpoint: {}".format(checkpointing_path))
-        torch.save({
+        print("Saving the Checkpoint: {}".format(checkpointing_path), flush = True)
+        chkpt_dict = {
             'epoch': epoch+1,
-            'model_state_dict': model.module.state_dict(),
+            'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'loss': loss,
             'patience_counter': patience_counter,
-            }, checkpointing_path)
-        
+            'early_stop_executed': early_stop_executed,
+            'early_stop_flag_tensor': early_stop_flag_tensor,
+            }
+        torch.save(chkpt_dict, checkpointing_path)
+                
     elif torch.cuda.device_count() < 1:
-        
-        logging.info("epoch: {} ".format(epoch+1))
+        print("epoch: {} ".format(epoch+1))
         checkpointing_path = args.checkpoint_path + chkpt_str
-        logging.info("Saving the Checkpoint: {}".format(checkpointing_path))
+        print("Saving the Checkpoint: {}".format(checkpointing_path))
         torch.save({
             'epoch': epoch+1,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'loss': loss,
             'patience_counter': patience_counter,
+            'early_stop_executed': early_stop_executed,
+            'early_stop_flag_tensor': early_stop_flag_tensor,
             }, checkpointing_path)
-        
-        
+
+# for torch.compile model loading issue with torch 2.1.2
+def remove_prefix(text, prefix):
+    if text.startswith(prefix):
+        return text[len(prefix) :]
+    return text
+
+#https://github.com/pytorch/pytorch/issues/101107
+def repair_checkpoint(ckpt, state_dict = 'model_state_dict', prefix_to_remove = 'module.'):
+    #ckpt = torch.load(path)
+    try:
+        in_state_dict = ckpt[state_dict]
+        pairings = [
+        (src_key, remove_prefix(src_key, prefix_to_remove))
+        for src_key in in_state_dict.keys()
+        ]
+        if all(src_key == dest_key for src_key, dest_key in pairings):
+            return ckpt[state_dict]  # Do not write checkpoint if no need to repair!
+        else:
+            out_state_dict = {}
+            for src_key, dest_key in pairings:
+                out_state_dict[dest_key] = in_state_dict[src_key]
+            ckpt[state_dict] = out_state_dict
+        #return ckpt[state_dict]
+        return ckpt
+    except:
+        print(f'Error: {state_dict} not found in checkpoint')
+        print(f'Available keys: {ckpt.keys()}')
+        print(f'ckpt: {ckpt}')
+    
+    
+
 def load_checkpoint(model, optimizer, gpu, args, val = False, test = False):
     '''
     # load model checkpoint based on training, validation metrics, and testing status
     '''
     if val:
         chkpt_str = f'checkpoint_best_validation_model_{args.param_file}.pth'
-    if not val and test:
+    elif not val and test:
        chkpt_str = f'best_validation_model_final_{args.param_file}.pth'
-            
-    logging.info("--------------------------------------------")
-    logging.info("Checkpoint file found!")
-    logging.info("Loading Checkpoint From: {}".format(args.checkpoint_path + chkpt_str))
+    else:
+        chkpt_str = f'checkpoint_best_validation_model_{args.param_file}.pth'
+        
+    print("--------------------------------------------")
+    print("Checkpoint file found!")
+    print("Loading Checkpoint From: {}".format(args.checkpoint_path + chkpt_str))
     
     if args.distributed:
-        dist.barrier()
         # configure map_location properly
         map_location = {'cuda:%d' % 0: 'cuda:%d' % gpu}
     elif torch.cuda.device_count() > 0:
@@ -167,53 +212,196 @@ def load_checkpoint(model, optimizer, gpu, args, val = False, test = False):
         
     checkpoint = torch.load(args.checkpoint_path + chkpt_str, map_location=map_location)
     
-
     #try except accounts for case in which model is loaded:
     #1. in a DDP script prior to initial torch.DDP call
     #2. on CPU 
-    try:
+    
+    try: 
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         epoch_number = checkpoint['epoch']
         loss = checkpoint['loss']
         patience_counter = checkpoint['patience_counter']
-        
+        early_stop_executed = checkpoint['early_stop_executed']
+        early_stop_flag_tensor = checkpoint['early_stop_flag_tensor']
     except:
-        # https://discuss.pytorch.org/t/failed-to-load-model-trained-by-ddp-for-inference/84841
-        from collections import OrderedDict
-        new_state_dict = OrderedDict()
-        for k, v in checkpoint['model_state_dict'].items():
-            name = k[7:] # remove 'module.' of DataParallel/DistributedDataParallel
-            new_state_dict[name] = v
-        checkpoint['model_state_dict'] = new_state_dict.copy()
-        
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        epoch_number = checkpoint['epoch']
-        loss = checkpoint['loss']
-        patience_counter = checkpoint['patience_counter']
-        
+        try:
+            for prefix in ['_orig_mod.','module.']:
+                checkpoint = repair_checkpoint(checkpoint,
+                                            state_dict = 'model_state_dict',
+                                            prefix_to_remove=prefix,
+                                            )
             
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            epoch_number = checkpoint['epoch']
+            loss = checkpoint['loss']
+            patience_counter = checkpoint['patience_counter']
+            early_stop_executed = checkpoint['early_stop_executed']
+            early_stop_flag_tensor = checkpoint['early_stop_flag_tensor']
+
+        except:
+            print(f'Error: Repair_Checkpoint failed for checkpoint: {chkpt_str}')
+            checkpoint = torch.load(args.checkpoint_path + chkpt_str, map_location=map_location)
+        
+            #try except accounts for case in which model is loaded:
+            #1. in a DDP script prior to initial torch.DDP call
+            #2. on CPU 
+            try:
+                print('Standard loading of checkpoint failed. Attempting to load checkpoint with prefix removal', flush = True)
+                #https://discuss.pytorch.org/t/failed-to-load-model-trained-by-ddp-for-inference/84841
+                from collections import OrderedDict
+                new_state_dict = OrderedDict()
+                for k, v in checkpoint['model_state_dict'].items():
+                    name = k[7:] # remove 'module.' of DataParallel/DistributedDataParallel
+                    new_state_dict[name] = v
+                checkpoint['model_state_dict'] = new_state_dict.copy()
+                
+                model.load_state_dict(checkpoint['model_state_dict'])
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                epoch_number = checkpoint['epoch']
+                loss = checkpoint['loss']
+                patience_counter = checkpoint['patience_counter']
+                early_stop_executed = checkpoint['early_stop_executed']
+                early_stop_flag_tensor = checkpoint['early_stop_flag_tensor']
+            except:
+                try:
+                    print('Prefix removal loading of checkpoint failed. Attempting to load checkpoint with compiled prefix removal', flush = True)
+                    print('Standard loading of checkpoint failed. Attempting to load checkpoint with _orig_mod.module prefix removal', flush = True)
+                    print('\n')
+                    print(f'RELOADING CHECKPIONT: {args.checkpoint_path + chkpt_str}', flush = True)
+
+                    checkpoint = torch.load(args.checkpoint_path + chkpt_str, map_location=map_location)
+
+                    new_state_dict = OrderedDict()
+                    for k, v in checkpoint['model_state_dict'].items():
+                        name = k[17:] # remove 'module.' of DataParallel/DistributedDataParallel
+                        new_state_dict[name] = v
+                    checkpoint['model_state_dict'] = new_state_dict.copy()
+                    
+                    model.load_state_dict(checkpoint['model_state_dict'])
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    epoch_number = checkpoint['epoch']
+                    loss = checkpoint['loss']
+                    patience_counter = checkpoint['patience_counter']
+                    early_stop_executed = checkpoint['early_stop_executed']
+                    early_stop_flag_tensor = checkpoint['early_stop_flag_tensor']
+                except:
+                    
+                    print('_orig_mod.module Prefix removal loading of checkpoint failed. Attempting to load checkpoint with compiled prefix removal', flush = True)
+                    print('Standard loading of checkpoint failed. Attempting to load checkpoint with _orig_mod.module.module. prefix removal', flush = True)
+                    print('\n')
+                    print(f'RELOADING CHECKPIONT: {args.checkpoint_path + chkpt_str}', flush = True)
+
+                    checkpoint = torch.load(args.checkpoint_path + chkpt_str, map_location=map_location)
+                    
+                    print(f'Final attempt Keys: {checkpoint.keys()}', flush = True)
+                    print(f'Final attempt Keys: {checkpoint["model_state_dict"].keys()}', flush = True)
+                    
+                    new_state_dict = OrderedDict()
+                    for k, v in checkpoint['model_state_dict'].items():
+                        name = k[24:] # remove 'module.' of DataParallel/DistributedDataParallel
+                        new_state_dict[name] = v
+                    checkpoint['model_state_dict'] = new_state_dict.copy()
+                    
+                    model.load_state_dict(checkpoint['model_state_dict'])
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    epoch_number = checkpoint['epoch']
+                    loss = checkpoint['loss']
+                    patience_counter = checkpoint['patience_counter']
+                    early_stop_executed = checkpoint['early_stop_executed']
+                    early_stop_flag_tensor = checkpoint['early_stop_flag_tensor']
+    
+
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, 
                                                           device_ids=[gpu],
+                                                          output_device=gpu,
                                                           #find_unused_parameters=True
                                                          )
     loss = checkpoint['loss']
-    logging.info("Checkpoint File Loaded - epoch_number: {}".format(epoch_number))
-    logging.info('Resuming training from epoch: {}'.format(epoch_number+1))
-    logging.info("--------------------------------------------")
-    return model, optimizer, epoch_number, loss, patience_counter
+    print("Checkpoint File Loaded - epoch_number: {}".format(epoch_number))
+    print('Resuming training from epoch: {}'.format(epoch_number+1))
+    print("--------------------------------------------")
+
+    early_stopper = EarlyStopper(patience=args.patience, device = gpu)
+    early_stopper.min_validation_loss = loss
+    early_stopper.counter = patience_counter
+    early_stopper.early_stop_executed = early_stop_executed
+    early_stopper.early_stop_flag_tensor = early_stop_flag_tensor
+
+    return model, optimizer, epoch_number, early_stopper
+
+
+
+def check_for_and_load_checkpoints_and_early_stopper(model, optimizer, gpu, args,):
+    
+    start_epoch, epoch = 0,0
+
+    early_stopper = EarlyStopper(patience=args.patience, device = gpu)
+    early_stopper.min_validation_loss = float('inf')
+    early_stopper.counter = 0
+       
+    if torch.cuda.device_count() > 0:
+        #check if fully trained model is avilable
+        if os.path.isfile(args.checkpoint_path + f'best_validation_model_final_{args.param_file}.pth'):
+            model, optimizer, start_epoch, early_stopper = load_checkpoint(model, 
+                                                                              optimizer,
+                                                                              gpu,
+                                                                              args,
+                                                                              val = False,
+                                                                              test = True)
+            epoch = args.epochs + 1
+    
+        #check if best validation checkpoint exists
+        elif os.path.isfile(args.checkpoint_path + f'checkpoint_best_validation_model_{args.param_file}.pth'):
+            model, optimizer, start_epoch, early_stopper = load_checkpoint(model, 
+                                                                              optimizer,
+                                                                              gpu,
+                                                                              args,
+                                                                              val = True)
+            epoch = start_epoch
+        
+        #check if any checkpoint exists
+        elif os.path.isfile(args.checkpoint_path + f'checkpoint_{args.param_file}.pth'):
+            model, optimizer, start_epoch, early_stopper = load_checkpoint(model, 
+                                                                              optimizer,
+                                                                              gpu,
+                                                                              args)
+            epoch = start_epoch
+
+    return model, optimizer, epoch, start_epoch, early_stopper
+
+
+
+def load_best_chkpt_save_as_final_model(model, optimizer,eval_loss, epoch, gpu, args, early_stopper):
+    
+    if torch.cuda.device_count() > 0:
+        
+        model, optimizer, epoch, early_stopper = load_checkpoint(model, 
+                                                                optimizer,
+                                                                gpu,
+                                                                args,
+                                                                val = True)
+        dist.barrier()
+        
+    save_checkpoint(model, optimizer, epoch, gpu, args, 
+            early_stopper, eval_loss,
+            val = False,
+            test = True)
+    
+    return model, optimizer
 
 
 # early stopper based on validation loss & patience
 class EarlyStopper:
-    def __init__(self, patience=1, min_delta=0):
+    def __init__(self, patience=1, device='cpu'):
         self.patience = patience
-        self.min_delta = min_delta
         self.counter = 0
         self.min_validation_loss = float('inf')
         self.early_stop_executed = False
+        self.early_stop_flag_tensor = torch.zeros(1).to(device)
+        self.early_stop_flag_tensor = self.early_stop_flag_tensor.float()
 
     def early_stop(self, 
                    validation_loss, 
@@ -226,18 +414,44 @@ class EarlyStopper:
         if validation_loss < self.min_validation_loss:
             self.min_validation_loss = validation_loss
             self.counter = 0
-            save_checkpoint(model, optimizer, epoch, gpu, args, 
-                            validation_loss, 
-                            patience_counter = self.counter,
-                            val = True)
+
+            if args.distributed:
+                if gpu == 0:   
+                    save_checkpoint(model, optimizer, epoch, gpu, args, 
+                                    self, #early stopper
+                                    validation_loss, 
+                                    val = True)
+            else:
+                save_checkpoint(model, optimizer, epoch, gpu, args, 
+                                    self, #early stopper
+                                    validation_loss,                                     
+                                    val = True)
         else:
             self.counter += 1
-            if self.counter >= self.patience:
-                print(f'epoch: {epoch}')
-                print(f'patience: {self.patience}')
-                print(f'counter: {self.counter}')
-                print(f'min_validation_loss: {self.min_validation_loss}')
-                print(f'validation_loss: {validation_loss}')
-                self.early_stop_executed = True
-                return True
-        return False
+
+            if args.distributed:
+                if gpu == 0:
+                    if self.counter >= self.patience:
+                        print(f'epoch: {epoch}', flush = True)
+                        print(f'patience: {self.patience}', flush = True)
+                        print(f'counter: {self.counter}', flush = True)
+                        print(f'min_validation_loss: {self.min_validation_loss}', flush = True)
+                        print(f'validation_loss: {validation_loss}', flush = True)
+                        self.early_stop_flag_tensor += 1.1
+                        self.early_stop_flag_tensor = self.early_stop_flag_tensor
+                        print(f'GPU 0 self.early_stop_flag_tensor: {self.early_stop_flag_tensor}', flush = True)
+                
+                if self.early_stop_flag_tensor > 1:
+                    self.early_stop_executed = True
+                
+            else:
+                if self.counter >= self.patience:
+                        print(f'epoch: {epoch}')
+                        print(f'patience: {self.patience}')
+                        print(f'counter: {self.counter}')
+                        print(f'min_validation_loss: {self.min_validation_loss}')
+                        print(f'validation_loss: {validation_loss}')
+                        self.early_stop_executed = True
+                        self.early_stop_flag_tensor += 1
+        
+        return self.early_stop_executed

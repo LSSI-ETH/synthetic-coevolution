@@ -125,11 +125,15 @@ class Transformer(nn.Module):
         self.args = args
         self.pos_encoder = PositionalEncoding(emb_dim, args, dropout)
         encoder_layers = TransformerEncoderLayer(emb_dim, nhead, nhid, 
-                                                 dropout, batch_first=True,
+                                                 dropout, 
+                                                 batch_first=True,
                                                  norm_first = True, 
-                                                 activation = 'relu')
+                                                 activation = 'relu',
+                                                 )
         
-        self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers)
+        self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers,
+                                                      enable_nested_tensor=False # ddp sync error when true
+                                                      )
 
         self.encoder = nn.Embedding(ntoken, emb_dim)
         self.flatten = nn.Flatten()
@@ -173,4 +177,3 @@ class Transformer(nn.Module):
         output = self.relu(output)
         output = self.dropout(output)
         return self.out_layer(output)
-    

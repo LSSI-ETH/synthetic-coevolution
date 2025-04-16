@@ -7,10 +7,10 @@ import math
 from transformers import EsmModel
 import numpy as np
 from models.attn_modules import self_attn_block, inter_attn_layer, get_esm_model_str
-    
+import os
+
 #----
 # RBD-pLM
-# masked label training adapted from https://github.com/QData/C-Tran        
 
 class RBD_pLM(nn.Module):
     def __init__(self,args,
@@ -20,7 +20,7 @@ class RBD_pLM(nn.Module):
                  use_lmt,
                  pos_emb=True,
                  heads=4,
-                 emb_dim = 320,
+                 emb_dim = 480,
                  ):
         super().__init__()
         
@@ -58,32 +58,26 @@ class RBD_pLM(nn.Module):
         #======================================================================
         # Label & Position Embeddings
         
-        # Label Embeddings
-        self.label_input = torch.Tensor(np.arange(num_labels)).view(1,-1).long()
-        self.label_lt = torch.nn.Embedding(num_labels, self.emb_dim, 
-                                           padding_idx=None)
-        self.label_lt.apply(self.init_weights)
-        
-        # State Embeddings
+        self.unknown_token = 81
         if args.use_lmt == True:
-            self.known_label_lt = torch.nn.Embedding(3,self.emb_dim, 
-                                                     #padding_idx = None)
-                                                     padding_idx=0)
-            
-            self.known_label_lt.apply(self.init_weights)
+
+            self.label_emb = torch.nn.Embedding(int(num_labels * 2 + 4), self.emb_dim, 
+                                           padding_idx= self.unknown_token)
+            self.label_emb.apply(self.init_weights)
             
         # Position Embeddings
         if self.use_pos_enc:
-            
-            self.position_embeddings_features = nn.Embedding(self.sequence_length, 
+
+            self.position_embeddings_features = nn.Embedding(self.sequence_length + self.num_labels, 
                                                            self.emb_dim)
             self.position_embeddings_features.apply(self.init_weights)    
-            
             self.dropout_pe_feats = nn.Dropout(self.dropout)
                 
         # Transformers
+        layer_inter_attn = inter_attn_layer
+
         self.inter_attn = nn.ModuleList(
-            [inter_attn_layer(d_model = self.emb_dim, 
+            [layer_inter_attn(d_model = self.emb_dim, 
                                 n_heads=heads,
                                 hdim = self.hidden,
                                 activation = self.args.activation,
@@ -115,7 +109,7 @@ class RBD_pLM(nn.Module):
                                                 output_dim = self.emb_dim,
                                                 bias = True,
                                                 )
-        
+
     def init_weights(self,module):
         """ Initialize the weights """
         if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -129,49 +123,55 @@ class RBD_pLM(nn.Module):
             if isinstance(module, nn.LayerNorm) and module.bias is not None:
                 module.bias.data.zero_()
         
-
-    def custom_replace(self, tensor,on_neg_1,on_zero,on_one):
-        '''
-        # Replace masked label tensor values 
-        # ensures that -1 (unk.) label is converted to 0 for use
-        # with torch.nn.Embedding layer
-        '''
-        res = tensor.clone()
-        res[tensor==-1] = on_neg_1
-        res[tensor==0] = on_zero
-        res[tensor==1] = on_one
-        return res
-                
     def forward(self,src,mask):
         
         BS = src.size(0)
-        
-        const_label_input = self.label_input.repeat(BS,1).to(self.device) 
-        label_embeddings = self.label_lt(const_label_input)  
 
         if self.backbone is not None:
             features = self.backbone(src)
         else:
             features = src.unsqueeze(1)
 
+        label_self_attn_mask = None
+        features_src_cross_attn_mask = None
+        combined_attn_mask = None
         if self.use_lmt:
-            # Convert mask values to positive integers for nn.Embedding
-            label_feat_vec = self.custom_replace(mask,0,1,2).long()
             
-            # Get state embeddings
-            state_embeddings = self.known_label_lt(label_feat_vec)
-            
-            # Add state embeddings to label embeddings
-            label_embeddings += state_embeddings       
+            # Create mask for unknown labels
+            unknown_label_mask = mask == self.unknown_token
 
+            # create self attention mask of shape (batch_size * attn_heads, num_labels) to prevent attending to unknown tokens
+            label_self_attn_mask = unknown_label_mask
+            label_self_attn_mask = unknown_label_mask.unsqueeze(1).repeat(1, mask.shape[1], 1)
+            label_self_attn_mask = label_self_attn_mask.unsqueeze(1).repeat(1, self.heads, 1, 1).view(BS * self.heads, mask.shape[1], mask.shape[1])
+
+            # create cross attention mask of shape (batch_size * attn_heads, num_labels, seq_len) to treat unknown tokens as padding
+            features_src_cross_attn_mask = unknown_label_mask.unsqueeze(1).repeat(1, features.shape[1], 1)
+            features_src_cross_attn_mask = features_src_cross_attn_mask.unsqueeze(1).repeat(1, self.heads, 1, 1).view(BS * self.heads, features.shape[1], mask.shape[1])
+
+            # create combined attention mask
+            truncated_sequence = src[:,1:-1] # remove BOE & EOS tokens
+            combined_seq_label_tensor = torch.cat((truncated_sequence, mask), dim=1)
+            combined_attn_mask = (combined_seq_label_tensor == self.unknown_token)
+            combined_attn_mask[:,:truncated_sequence.shape[1]] = False
+            combined_attn_mask = combined_attn_mask.unsqueeze(1).repeat(1, truncated_sequence.shape[1] + mask.shape[1], 1)
+            combined_attn_mask = combined_attn_mask.unsqueeze(1).repeat(1, self.heads, 1, 1).view(BS * self.heads, truncated_sequence.shape[1] + mask.shape[1], truncated_sequence.shape[1] + mask.shape[1])
+            
+            label_embeddings = self.label_emb(mask) 
+            
         if self.use_pos_enc:
-            position_ids_features = torch.arange(0, features.size(1), dtype=torch.long, device=self.device)
+            
+            # Positional Encoding on both Seq & Label features
+            labels_and_sequence = torch.cat([features,label_embeddings],dim = 1)
+            position_ids_features = torch.arange(0, labels_and_sequence.size(1), dtype=torch.long, device=self.device)
             position_ids_features = position_ids_features.unsqueeze(0).repeat(BS, 1) 
             position_embeddings_features = self.position_embeddings_features(position_ids_features)
-            features  += position_embeddings_features
-            features = self.dropout_pe_feats(features)
 
-        label_self_attn_mask,features_src_cross_attn_mask  = None, None
+            labels_and_sequence += position_embeddings_features
+            labels_and_sequence = self.dropout_pe_feats(labels_and_sequence)
+            features = labels_and_sequence[:,0:self.sequence_length,:]    
+            label_embeddings = labels_and_sequence[:,-label_embeddings.size(1):,:]    
+
         for inter_attn in self.inter_attn:
             label_embeddings, features = inter_attn(Lf = label_embeddings,
                                                     Sf = features,
@@ -179,53 +179,24 @@ class RBD_pLM(nn.Module):
                                                     cross_attn_label_mask = features_src_cross_attn_mask,
                                                     )
         attns = None
-        assert self.args.combined_attn_layers > 0
-            
         embeddings = torch.cat([features,label_embeddings],dim = 1)
         embeddings = self.LayerNormIntermediate(embeddings)
-        
+
         attns = []
         for combined_self_attn in self.combined_self_attn:
-            embeddings, attn = combined_self_attn(embeddings)
+            embeddings, attn = combined_self_attn(embeddings, attn_mask = combined_attn_mask)
             if attn is not None:
                 attns += attn.detach().unsqueeze(0).data
             else:
                 attns = None
+
         label_embeddings = embeddings[:,-label_embeddings.size(1):,:]    
         features = embeddings[:,0:self.sequence_length,:]    
         embeddings = label_embeddings
-        return self.output_linear(embeddings), attns     
-
-
-
-#----
-# ESM-2 Backbone
-#https://github.com/facebookresearch/esm
-
-class Backbone_ESM(nn.Module):
-    def __init__(self, args):
-        super().__init__()
         
-        model_str, self.esm_emb_dim = get_esm_model_str(args)
-        
-        self.base_network = EsmModel.from_pretrained(model_str,
-                                                     output_attentions = args.return_esm_attns,
-                                                     output_hidden_states = False,
-                                                     )
-        for param in self.base_network.parameters():
-            param.requires_grad = False
-        for param in self.base_network.pooler.parameters(): 
-                param.requires_grad=False
-        for param in self.base_network.contact_head.parameters(): 
-                param.requires_grad=False
-        
+        return self.output_linear(embeddings), attns
 
-    def forward(self,x):        
-        x = self.base_network(x).last_hidden_state
-        x = x[:,1:-1,:] #omit bos & eos tokens
-        return x
-    
-#----
+
 # Elementwise weighted pooling layer https://arxiv.org/abs/1908.07325
 
 class ElementwisePoolingLayer(nn.Module):
@@ -260,3 +231,34 @@ class ElementwisePoolingLayer(nn.Module):
         if self.bias is not None:
             x = x + self.bias
         return x
+    
+    
+
+class Backbone_ESM(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        
+        model_str, self.esm_emb_dim = get_esm_model_str(args)
+        self.args = args
+        
+        if os.environ['TRANSFORMERS_OFFLINE']== '1':
+           path = os.environ['HOME']
+           model_str = f"{path}/.cache/huggingface/models/{model_str}"
+        
+        self.base_network = EsmModel.from_pretrained(model_str,
+                                                        output_attentions = args.return_esm_attns,
+                                                        output_hidden_states = False,
+                                                        )
+        for param in self.base_network.parameters():
+            param.requires_grad = False
+        for param in self.base_network.pooler.parameters(): 
+                param.requires_grad=False
+        for param in self.base_network.contact_head.parameters(): 
+                param.requires_grad=False
+        
+    def forward(self,x):
+        x = self.base_network(x).last_hidden_state
+        x = x[:,1:-1,:] #omit bos & eos tokens
+        return x
+
+    

@@ -12,9 +12,12 @@ using package iterstrat for multi-label data set splitting
 
 import pandas as pd
 from iterstrat.ml_stratifiers import MultilabelStratifiedShuffleSplit
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
 from collections import defaultdict
 from Levenshtein import distance as levenshtein_distance
-from sklearn.model_selection import train_test_split
+
 
 #===========================   Consensus Sequence & ED ============================== 
 def consensus_seq_and_LD_to_df(data_frame, seq_col_str = 'aa_seq', return_df = True):
@@ -77,13 +80,18 @@ def add_LD_to_df(data_frame, seq_col_str, consensus_sequence):
 
 
 
+
+
+
 PATH = '../data' 
+
 
 data_frame = pd.read_csv(PATH + '/full_data_pre_split.gz')
 
-#ensure ace2 escapes are represented
-label_cols = data_frame.columns[7:]
-data_frame, _ = consensus_seq_and_LD_to_df(data_frame)
+data_frame, wild_type = consensus_seq_and_LD_to_df(data_frame)
+
+
+label_cols = data_frame.columns[7:-1]
 
 #ensure ace2 escapes are represented
 ace2_negs = data_frame[data_frame['ACE2'] == 0].copy()
@@ -92,8 +100,6 @@ ace2_negs = ace2_negs[ace2_negs['num_labels'] == 1]
 #remove ace2 non-binders
 data_frame = data_frame[data_frame['num_labels'] > 1]
 data_frame = data_frame[data_frame['ACE2'] == 1]
-
-
 
 df = pd.DataFrame()
 for mab in ['LY1404', 'S309', '87wt', '555wt','33wt']:
@@ -126,65 +132,60 @@ data_frame = data_frame[~data_frame.aa_seq.isin(excluded_testset1.aa_seq)]
 data_frame = data_frame[~data_frame.aa_seq.isin(excluded_testset2.aa_seq)]
 data_frame = data_frame[~data_frame.aa_seq.isin(excluded_testset3.aa_seq)]
 
+data_frame = data_frame.drop_duplicates(subset = ['aa_seq'], keep = 'first')
 
-#==================== Split into Train/Val/Test ================================
-x = data_frame['aa_seq']
-y = data_frame[label_cols]
+holdout = [86, 108, 111, 112, 116, 118, 120, 123, 124, 129, 130, 144, 146, 154, 155, 160, 171, 175] #train: 84771, test: 264567
 
-x = x.to_numpy()
-y = y.to_numpy()
+def train_test_split_by_subsets(df, wild_type, positions_to_avoid):
+    sequence_list = df.aa_seq.to_list()
 
-msss = MultilabelStratifiedShuffleSplit(n_splits=2, 
-                                        test_size=0.3, random_state=42)
-
-for train_index, test_index in msss.split(x, y):
-    x_train, x_test_temp = x[train_index], x[test_index]
-    y_train, y_test_temp = y[train_index], y[test_index]
-
-# make some memory space
-del x
-del y
-
-# split to test / validation
-msss = MultilabelStratifiedShuffleSplit(n_splits=2, 
-                                        test_size=0.5, random_state=42)
-
-for test_index, val_index in msss.split(x_test_temp, y_test_temp):
-    x_test, x_val = x_test_temp[test_index], x_test_temp[val_index]
-    y_test, y_val = y_test_temp[test_index], y_test_temp[val_index]
-
-train = data_frame[data_frame['aa_seq'].isin(x_train)]
-val = data_frame[data_frame['aa_seq'].isin(x_val)]
-test = data_frame[data_frame['aa_seq'].isin(x_test)]
-
-#remove single value high edit distance sequences for ease of splitting
-ace2_negs = ace2_negs[ace2_negs['LD'] < 22]
-num_negs = 25000
-
-#sample LD distribution to mirror that of full negative set
-ace2_negs_val_test, ace2_negs_train, = train_test_split(ace2_negs, test_size = num_negs,
-                                       random_state = 1, shuffle = True, stratify = ace2_negs['LD'])
-
+    seqs_for_test_set = []
+    for i in range(len(sequence_list)):
+        wt_mismatch_count = 0
+        entry = sequence_list[i]
+        
+        for j in range(len(positions_to_avoid)):
+            eval_idx = positions_to_avoid[j]
+            if entry[eval_idx] !=  wild_type[eval_idx]:
+                wt_mismatch_count += 1
+        
+        if wt_mismatch_count == 0:
+            seqs_for_test_set.append(entry)
     
-ace2_negs_test, ace2_negs_val, = train_test_split(ace2_negs_val_test, test_size = int(0.2* num_negs),
-                                       random_state = 1, shuffle = True, stratify = ace2_negs_val_test['LD'])
+    train = data_frame[~data_frame['aa_seq'].isin(seqs_for_test_set)]
+    test = data_frame[data_frame['aa_seq'].isin(seqs_for_test_set)]
+    
+    return train, test
 
-_, ace2_negs_test, = train_test_split(ace2_negs_test, test_size = num_negs,
-                                       random_state = 1, shuffle = True, stratify = ace2_negs_test['LD'])
+train, test = train_test_split_by_subsets(data_frame, wild_type, holdout)
+
+test.to_csv(f'{PATH}/holdout_test.gz', index = False, header = True)
 
 
-train = pd.concat([train,ace2_negs_train],ignore_index=True).sample(frac = 1, random_state = 42)
-train = pd.concat([train,ace2_negs_val],ignore_index=True).sample(frac = 1, random_state = 42)
-test = pd.concat([test,ace2_negs_test],ignore_index=True).sample(frac = 1, random_state = 42)
+def create_train_val_sets(train):
+    #==================== Split into Train/Val/Test ================================
+    x = train['aa_seq']
+    y = train[label_cols]
+    
+    x = x.to_numpy()
+    y = y.to_numpy()
+    
+    msss = MultilabelStratifiedShuffleSplit(n_splits=2, 
+                                            test_size=0.3, random_state=42)
+    
+    for train_index, test_index in msss.split(x, y):
+        x_train, x_val = x[train_index], x[test_index]
+        y_train, y_val = y[train_index], y[test_index]
+    
+    # make some memory space
+    del x
+    del y
+    
+    val = train[train['aa_seq'].isin(x_val)]
+    train = train[train['aa_seq'].isin(x_train)]
+    return train, val
 
-train = train.drop_duplicates(subset = ['aa_seq'], keep = False)
-val = val.drop_duplicates(subset = ['aa_seq'], keep = False)
-test = test.drop_duplicates(subset = ['aa_seq'], keep = False)
+train, val = create_train_val_sets(train)
 
-train = train.drop(columns = ['LD'])
-val = val.drop(columns = ['LD'])
-test = test.drop(columns = ['LD'])
-
-train.to_csv(f'{PATH}/train.gz', index = False, header = True)
-val.to_csv(f'{PATH}/val.gz', index = False, header = True)
-test.to_csv(f'{PATH}/test.gz', index = False, header = True)
+train.to_csv(f'{PATH}/holdout_train.gz', index = False, header = True)
+val.to_csv(f'{PATH}/holdout_val.gz', index = False, header = True)

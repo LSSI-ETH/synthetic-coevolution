@@ -6,12 +6,10 @@ import glob
 import pandas as pd
 
 # aggregate results files for plotting
-
 path = '../results/'
 extension = 'csv'
 os.chdir(path)
 df_list = glob.glob('*.{}'.format(extension))
-print(df_list)
 
 out_df = pd.DataFrame()
 for df in df_list:

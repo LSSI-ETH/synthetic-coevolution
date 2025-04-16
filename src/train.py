@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.parallel
 import torch.optim
 import torch.utils.data
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import GradScaler
 
 from models.models import CNN, Transformer, LogisticRegression
 from models.plm_only import PlmOnly
@@ -18,6 +18,7 @@ from torchmetrics.classification import MultilabelF1Score, MultilabelJaccardInde
 from torchmetrics.functional.classification import binary_matthews_corrcoef
 
 from transformers import AdamW
+import pytorch_warmup as warmup
 import logging
 import wandb
 
@@ -44,7 +45,7 @@ class Trainer(nn.Module):
                              args = args).to(self.device)
 
         elif args.basemodel == 'transformer' :
-            embedding_dim = 320
+            embedding_dim = 480
             hidden_dim = embedding_dim
             
             num_layers = 3
@@ -66,7 +67,7 @@ class Trainer(nn.Module):
         
 
         elif args.basemodel == 'rbd_plm':
-            embedding_dim = 128
+            embedding_dim = 480
             self.model = RBD_pLM(args = self.args,
                                  device = self.device,
                                  num_labels = self.num_classes,
@@ -79,11 +80,11 @@ class Trainer(nn.Module):
 
         elif args.basemodel == 'rbd_plm_lr': # plm only
             self.model = PlmOnly(input_size = 201,
-                               input_emb_dim = 320, 
+                               input_emb_dim = 480, 
                                n_classes = 39, 
                                args = args,
                                device = self.device)
-    
+            
         #---
         # optimizer
         self.learning_rate = args.learn_rate
@@ -118,6 +119,34 @@ class Trainer(nn.Module):
             self.optimizer = torch.optim.SGD(self.model.parameters(), 
                                              lr=args.learn_rate, 
                                              momentum=0.9)
+        
+        #--
+        # lr scheduler
+        
+        self.scheduler = None
+        if args.lr_scheduler == 'cosine_restart_warmup':
+
+            self.warmup_epochs = args.warmup_epochs
+            self.num_steps = args.epochs * args.train_len / args.batch_size
+            
+            num_batches = args.train_len // args.batch_size
+            self.warmup_steps = self.warmup_epochs * num_batches
+
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(self.optimizer, T_0=10, T_mult=2)
+            self.warmup_scheduler = warmup.LinearWarmup(self.optimizer, self.warmup_steps)
+        
+        elif args.lr_scheduler == 'cosine_warmup_no_restarts':
+
+            self.warmup_epochs = args.warmup_epochs
+            self.num_steps = args.epochs * args.train_len // args.batch_size
+            
+            num_batches = args.train_len // args.batch_size
+            self.warmup_steps = self.warmup_epochs * num_batches
+
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max = self.num_steps, eta_min=1e-6)
+            self.warmup_scheduler = warmup.LinearWarmup(self.optimizer, self.warmup_steps)
+
+
         #---
         # loss function
         if args.loss_fn == 'bce':
@@ -156,12 +185,12 @@ class Trainer(nn.Module):
         self.scaler = GradScaler(enabled = args.use_amp)
             
     # handle predictions for different model types
-    def get_predictions(self,model, X, mask = None):
+    def get_predictions(self,model, X, masked_labels = None):
         attns = None
         if 'transformer' in self.args.basemodel:        
             pred = model(X)
         elif 'rbd_plm' in self.args.basemodel:
-            pred, attns = model(X, mask)
+            pred, attns = model(X, masked_labels)
         else:       
             pred = model(X.float())
         return pred, attns
@@ -186,63 +215,46 @@ class Trainer(nn.Module):
         
         self.optimizer.zero_grad(set_to_none=True)
 
-        for batch, (X, labels, mask, ignored_label_idxs) in enumerate(train_dataloader):
+        for batch, (X, labels, masked_labels, masked_indices) in enumerate(train_dataloader):
 
             X = X.to(self.device, non_blocking = self.args.non_block)
             labels = labels.to(self.device, non_blocking = self.args.non_block)
-            
-            with autocast(enabled = self.args.use_amp):
+
+
+            with torch.autocast(enabled = self.args.use_amp, device_type=labels.device.type):
                 if 'rbd_plm' in self.args.basemodel:
-                    mask = mask.to(self.device, non_blocking = self.args.non_block)
-                    ignored_label_idxs = ignored_label_idxs.to(self.device, non_blocking = self.args.non_block)
+                    if self.args.basemodel != 'rbd_plm_lr':
+                        masked_labels = masked_labels.to(self.device, non_blocking = self.args.non_block)
+                        masked_indices = masked_indices.to(self.device, non_blocking = self.args.non_block)
 
-                    pred, _ = self.get_predictions(self.model, X, mask = mask)
-
+                    pred, _ = self.get_predictions(self.model, X, masked_labels = masked_labels)
                 else:
                     pred, _ = self.get_predictions(self.model, X)                
 
-                if self.args.loss_fn != 'bce':
-                    loss = self.loss_fn(pred,labels, 
-                                        rbd_plm_ignored_label_idxs = ignored_label_idxs,
-                                        args = self.args)                
-
-                if self.args.loss_fn == 'bce':
-                    loss = self.loss_fn(pred,labels)
-                    
-                    if 'rbd_plm' in self.args.basemodel:
-                        
-                        if self.args.use_lmt == True:
-                            unkown_label_mask = self.replace_label_values(labels, 0,1,1)
-                            loss = (unkown_label_mask * loss)
-                            
-                            if self.args.loss_reduce == 'mean':
-                                loss = loss.sum() / unkown_label_mask.sum()
-                            elif self.args.loss_reduce == 'sum':
-                                loss = loss.sum()
-                            
-                            
-                        elif self.args.use_lmt == False:
-                            unkown_label_mask = self.replace_label_values(labels, 0,1,1)
-                            loss = (unkown_label_mask * loss)
-                            
-                            if self.args.loss_reduce == 'mean':
-                                loss = loss.sum() / unkown_label_mask.sum()
-                            elif self.args.loss_reduce == 'sum':
-                                loss = loss.sum()
-                            
-                    else:
-                        unkown_label_mask = self.replace_label_values(labels, 0,1,1)
-                        loss = (unkown_label_mask * loss)
-                        
-                        if self.args.loss_reduce == 'mean':
-                            loss = loss.sum() / unkown_label_mask.sum()
-                        elif self.args.loss_reduce == 'sum':
-                            loss = loss.sum()
+                loss = self.loss_fn(pred,labels)
+                
+                if 'rbd_plm' in self.args.basemodel and self.args.basemodel != 'rbd_plm_lr' and self.args.use_lmt == True:
+                        loss = masked_indices * loss
+                        loss = loss.sum() / masked_indices.sum()
+                else:
+                    unkown_label_mask = self.replace_label_values(labels, 0,1,1)
+                    loss = (unkown_label_mask * loss)
+                    loss = loss.sum() / unkown_label_mask.sum()
                         
             loss = loss / self.args.grad_accumulation_steps
             train_loss += loss
+
             self.scaler.scale(loss).backward()
-            
+            if self.scheduler is not None:
+                if self.args.lr_scheduler == 'cosine_restart_warmup':
+                    with self.warmup_scheduler.dampening():
+                        if epoch >= self.args.warmup_epochs:
+                            self.scheduler.step(epoch-self.args.warmup_epochs + batch / len(train_dataloader))
+                elif self.args.lr_scheduler == 'cosine_warmup_no_restarts':
+                    with self.warmup_scheduler.dampening():
+                        if self.warmup_scheduler.last_step + 1 >= self.warmup_steps:
+                            self.scheduler.step()
+                    
             #check for unused parameters
             #for name, param in self.model.named_parameters():
                 #if param.grad is None and param.requires_grad == True:
@@ -253,7 +265,7 @@ class Trainer(nn.Module):
                 self.scaler.step(self.optimizer) 
                 self.scaler.update()        
                 self.optimizer.zero_grad(set_to_none=True) 
-        
+    
         if is_rank0_wandb and self.args.wandb_logging:
             wandb.log({"train/train_loss": train_loss})
             wandb.log({'epoch': epoch, 
@@ -261,11 +273,11 @@ class Trainer(nn.Module):
         
         print(f'Train Loss: {train_loss}')
         logging.info(f'Train Loss: {train_loss}')
-            
+
+
     def test_step(self, test_loader,epoch, is_rank0_wandb, is_test = False):
         
-        self.model.eval()
-        
+        self.model.eval()        
         test_loss = 0
         val_args = False
         
@@ -308,8 +320,6 @@ class Trainer(nn.Module):
         
         mcc = MatthewsCorrCoef(task = 'multilabel', num_labels = self.num_classes, 
                                ignore_index = -1, validate_args=val_args).to(self.device)
-        
-        
         
         #=========================== Head Label Metrics =====================
         head_num_lcasses = len(self.idx_head)
@@ -368,44 +378,31 @@ class Trainer(nn.Module):
         
         with torch.no_grad():
             
-            for batch_idx, (inputs, labels, mask, ignored_label_idxs) in enumerate(test_loader):
+            for batch_idx, (inputs, labels, mask, masked_indicess) in enumerate(test_loader):
                 inputs = inputs.to(self.device, non_blocking = self.args.non_block)
                 labels = labels.to(self.device, non_blocking = self.args.non_block)
                 
-                
-                with autocast(enabled = self.args.use_amp):
-                    if 'rbd_plm' in self.args.basemodel:
-                        mask = self.replace_label_values(labels, -1,-1,-1)
+                attns = None
+                with torch.autocast(enabled = self.args.use_amp, device_type = labels.device.type):
+                    if self.args.basemodel == 'rbd_plm':
                         mask = mask.to(self.device, non_blocking = self.args.non_block)
-                        
-                        ignored_label_idxs = (labels == -1)
-                        ignored_label_idxs = ignored_label_idxs.to(self.device, non_blocking = self.args.non_block)
-                        
-                        pred, attns = self.get_predictions(self.model, inputs, mask = mask)                
+                        # flip known labels to mask token
+                        mask = torch.where(mask != 81, 80, 81)    
+                        pred, attns = self.get_predictions(self.model, inputs, masked_labels = mask)
                     else:
                         pred, attns = self.get_predictions(self.model, inputs)
                 
                     if not is_test:
-                        
-                        if self.args.loss_fn !='bce':
-                            loss = self.loss_fn(pred,labels, 
-                                                rbd_plm_ignored_label_idxs = ignored_label_idxs,
-                                                args = self.args)
-                        else:
-                            loss = self.loss_fn(pred,labels)
-        
-                        if self.args.loss_fn == 'bce':
-                                unkown_label_mask = self.replace_label_values(labels, 0,1,1)
-                                loss = (unkown_label_mask * loss)
+                        loss = self.loss_fn(pred,labels)
 
-                                if self.args.loss_reduce == 'mean':
-                                    loss = loss.sum() / unkown_label_mask.sum()
-                                elif self.args.loss_reduce == 'sum':
-                                    loss = loss.sum()
-                                
-                        
+                        if self.args.basemodel != 'rbd_plm':
+                            unkown_label_mask = self.replace_label_values(labels, 0,1,1)
+                        else:
+                            unkown_label_mask = (mask == 80)
+
+                        loss = (unkown_label_mask * loss)
+                        loss = loss.sum() / unkown_label_mask.sum()
                         test_loss += loss
-                
                 
                 labels_long = labels.long()
 
@@ -490,7 +487,6 @@ class Trainer(nn.Module):
         metrics['f1_weighted'] = f1_weighted.compute()
         metrics['f1_none'] = f1_none.compute()
         
-        
         metrics['hamming_macro']= hamming_macro.compute()
         metrics['hamming_micro'] = hamming_micro.compute()
         metrics['hamming_weighted'] = hamming_weighted.compute()
@@ -553,6 +549,7 @@ class Trainer(nn.Module):
         logging.info(f'\nVal set: Average loss: {test_loss}')
         logging.info('==========') 
         logging.info(f'Val MCC: {metrics["mcc"]}')
+        print(f'Val MCC: {metrics["mcc"]}')
         
         if is_rank0_wandb and self.args.wandb_logging:
             if not is_test:
@@ -567,4 +564,5 @@ class Trainer(nn.Module):
                 wandb.log({'epoch': epoch, 
                        'test_mcc': metrics['mcc']})
         
+
         return metrics, attns
