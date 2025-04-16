@@ -156,8 +156,6 @@ dmypy.json
 .tar.gz
 *.tar
 .tar
-*.gz
-.gz
 *.pth
 .pth
 .pdf

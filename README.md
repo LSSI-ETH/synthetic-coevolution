@@ -1,4 +1,4 @@
-![Python Version: 3.10.11](https://img.shields.io/badge/Python-3.10.11-blue)(https://www.python.org/)
+[![Python Version: 3.10.11](https://img.shields.io/badge/Python-3.10.11-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-brightgreen)](https://opensource.org/licenses/MIT)
 
 # Synthetic coevolution reveals adaptive mutational trajectories of neutralizing antibodies and SARS-CoV-2
